@@ -41,12 +41,12 @@ type ExprType =
 let (|MethodCall|_|) (e:Expression)   = 
     match e.NodeType, e with 
     | ExpressionType.Call, (:? MethodCallExpression as e) -> 
-         Some (e.Arguments |> Seq.toList, Method (e.Method, e.Method.Name)) 
+         Some (Method (e.Method, e.Method.Name), e.Arguments |> Seq.toList) 
     | _ -> None
   
 let (|SpecificCall|_|) name (e:Expression) = 
     match e with
-    | MethodCall(args, (Method(_, mName) as m)) when mName = name -> Some (args, m)
+    | MethodCall(Method(_, mName) as m, args) when mName = name -> Some (m, args)
     | _ -> None
    
 let (|MemberAccess|_|) (e:Expression) = 
@@ -63,7 +63,7 @@ let (|NewObj|_|) (e:Expression) =
              match a with
              | MemberAccess expr -> 
                  expr :: s
-             | MethodCall (_, meth) -> 
+             | MethodCall (meth, _) -> 
                 meth :: s
              | _ -> s
         ) ([])
@@ -98,62 +98,79 @@ let (|Lambda|_|) (e:Expression) =
         | _ -> None
     | _ -> None
 
-let (|Select|_|) (e:Expression) =
-    match e with
-    | SpecificCall "Select" (args, expr) ->
+let foldExpressions state projs = 
+    projs
+    |> List.fold (fun s expr ->
         match expr with
-        | Member(mi, name) -> Some (mi.DeclaringType, Column name)
+        | Member(mi, name) -> (mi.DeclaringType, Column name) :: s
         | Method(mi, methodName) -> 
             match methodName with
-            | "Count" -> Some(mi.DeclaringType, Count methodName)
-            | "Sum" -> Some(mi.DeclaringType, Count methodName)
-            | _ -> None
+            | "Count" -> (mi.DeclaringType, Count methodName) :: s
+            | "Sum" -> (mi.DeclaringType, Count methodName) :: s
+            | _ -> s
+    ) state
+
+let (|Select|_|) (e:Expression) =
+    match e with
+    | SpecificCall "Select" (expr, [source; (Quote (Lambda (retType, projs)))]) ->          
+        Some (retType, foldExpressions [] projs)
     | _ -> None
 
-type QueryProvider(expressionWalker : Expression -> IQueryable) = 
+let (|GroupBy|_|) (e:Expression) =
+    match e with
+    | SpecificCall "GroupBy" (expr, [source; (Quote (Lambda (retType, projs)))]) -> 
+        let retType = e.Type.GenericTypeArguments.[0]         
+        Some (retType, foldExpressions [] projs)
+    | _ -> None
+
+
+type QueryProvider(state, expressionWalker : SqlExpr list -> Expression -> IQueryable) = 
      interface IQueryProvider with
-          member __.CreateQuery(e:Expression) : IQueryable = expressionWalker e 
-          member __.CreateQuery<'T>(e:Expression) : IQueryable<'T> = expressionWalker e :?> IQueryable<'T>
+          member __.CreateQuery(e:Expression) : IQueryable = expressionWalker state e 
+          member __.CreateQuery<'T>(e:Expression) : IQueryable<'T> = expressionWalker state e :?> IQueryable<'T>
           member __.Execute(e:Expression) : obj = printfn "Called execute"; Unchecked.defaultof<_>
           member __.Execute<'T>(e:Expression) : 'T = 
-            let w = expressionWalker e
-            printfn "Called execute<T> %A" (w :?> Queryable<'T>).Sql; 
-            
+            let w = expressionWalker state e
+            printfn "Called execute<T> %A" state;
             if typeof<'T>.GetInterfaces().Contains(typeof<Collections.IEnumerable>)
             then unbox<'T> <| box [Microsoft.FSharp.Linq.RuntimeHelpers.AnonymousObject<_,_>("colin", 31)]
             else Unchecked.defaultof<'T>
 
+and Queryable(sqlExpr) =
+    member x.Sql : SqlExpr list = sqlExpr    
+
 and Queryable<'T>(sqlexpr, expressionWalker) =
-     member x.Sql = sqlexpr      
+     inherit Queryable(sqlexpr) 
      interface IQueryable<'T> with 
          member x.GetEnumerator() = 
             let iq = (x :> IQueryable)
             iq.Provider.Execute<seq<'T>>(iq.Expression).GetEnumerator()
 
      interface IQueryable with
-         member x.Provider = new QueryProvider(expressionWalker) :> IQueryProvider
+         member x.Provider = new QueryProvider(sqlexpr, expressionWalker) :> IQueryProvider
          member x.Expression =  Expression.Constant(x,typeof<IQueryable<'T>>) :> Expression 
          member x.ElementType = typeof<'T>
          member x.GetEnumerator() = 
              let iq = (x :> IQueryable)
              (iq.Provider.Execute<Collections.IEnumerable>(iq.Expression)).GetEnumerator()
 
-let rec expressionWalker<'a> (e:Expression) = 
+let rec expressionWalker<'a> state (e:Expression) = 
 
     let createQueryable returnType source = 
         let ty = typedefof<Queryable<_>>.MakeGenericType(returnType)
         ty.GetConstructors().[0].Invoke([|source; box expressionWalker|]) :?> IQueryable
 
     match e with
-    | Select (retType, projs) ->    
-        createQueryable [|retType|] (SelectExpr(projs))
-    | Call(e, (Method "GroupBy" m), [source; (Quote (Lambda (_, h::_)))]) ->
-        let retType = m.ReturnType.GenericTypeArguments.[0]
-        createQueryable [|retType|] (GroupByExpr(h))
-    | _ -> createQueryable [|e.Type|] Empty
+    | Select (retType, projs) ->   
+        createQueryable [|retType|] (SelectExpr(projs) :: state)
+    | GroupBy (retType, h :: _) ->
+        createQueryable [|retType|] (GroupByExpr(h) :: state)
+    | _ -> 
+    //    let retType = e.Type.GenericTypeArguments.[0]
+        createQueryable [|e.Type|] (Empty :: state)
 
          
-let q = new Queryable<_>(Empty, expressionWalker)
+let q = new Queryable<_>([], expressionWalker)
 
 
 [<EntryPoint>]
